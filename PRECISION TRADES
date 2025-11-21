@@ -1,0 +1,375 @@
+"""
+
+import time
+import math
+import logging
+from datetime import datetime, timedelta
+import pandas as pd
+import requests
+
+# OANDA helper library (optional). If you prefer pure requests, adapt accordingly.
+try:
+    import oandapyV20
+    from oandapyV20 import API
+    from oandapyV20.endpoints import instruments, orders, trades, accounts
+    OANDA_AVAILABLE = True
+except Exception:
+    OANDA_AVAILABLE = False
+
+# --------------------------
+# CONFIG - EDIT THESE
+# --------------------------
+CONFIG = {
+    "OANDA_API_KEY": "REPLACE_WITH_YOUR_API_KEY",
+    "OANDA_ACCOUNT_ID": "REPLACE_WITH_YOUR_ACCOUNT_ID",
+    "PRACTICE": True,  # True -> api-fxpractice; False -> api-fxtrade
+    "INSTRUMENT": "USD_JPY",   # OANDA uses underscore sometimes; we'll format below
+    "UNITS": 1000,             # positive for buy, negative for sell (position size)
+    "HFT": "H4",               # higher timeframe to determine bias
+    "LFT": "H1",               # lower timeframe for entries
+    "POLL_INTERVAL": 15,       # seconds between checks
+    "TP_RR": 2.0,              # target RR multiple of stop distance (if used)
+    "MAX_TRADES": 1,           # only 1 trade open at a time in this example
+}
+
+# --------------------------
+# Logging
+# --------------------------
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(message)s")
+
+# --------------------------
+# Utility helpers
+# --------------------------
+def format_instrument(inst):
+    # OANDA expects e.g. "USD_JPY"
+    return inst.replace("/", "_").replace("-", "_")
+
+def epoch_ms_to_dt(ms):
+    return datetime.utcfromtimestamp(ms / 1000.0)
+
+# --------------------------
+# OANDA API helper functions
+# --------------------------
+class OandaClient:
+    def __init__(self, token, account_id, practice=True):
+        self.token = token
+        self.account_id = account_id
+        self.practice = practice
+        self.host = "https://api-fxpractice.oanda.com" if practice else "https://api-fxtrade.oanda.com"
+        if OANDA_AVAILABLE:
+            # uses oandapyV20 lib for convenience
+            self.api = API(access_token=token, environment="practice" if practice else "live")
+        else:
+            self.api = None
+
+    def _headers(self):
+        return {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json"
+        }
+
+    def get_candles(self, instrument, granularity, count=200):
+        """
+        Fetch recent candles via REST. Returns pandas DataFrame with time, o,h,l,c
+        """
+        fmt_inst = instrument if "_" in instrument else format_instrument(instrument)
+        url = f"{self.host}/v3/instruments/{fmt_inst}/candles"
+        params = {"granularity": granularity, "count": count, "price": "M"}
+        r = requests.get(url, headers=self._headers(), params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()["candles"]
+        rows = []
+        for c in data:
+            # using mid prices
+            mid = c["mid"]
+            rows.append({
+                "time": c["time"],
+                "o": float(mid["o"]),
+                "h": float(mid["h"]),
+                "l": float(mid["l"]),
+                "c": float(mid["c"]),
+                "complete": c["complete"]
+            })
+        df = pd.DataFrame(rows)
+        df["time"] = pd.to_datetime(df["time"])
+        return df
+
+    def place_market_order(self, instrument, units, tp_price=None, sl_price=None):
+        """
+        Place a market order with optional stopLossOnFill and takeProfitOnFill
+        """
+        fmt_inst = instrument if "_" in instrument else format_instrument(instrument)
+        url = f"{self.host}/v3/accounts/{self.account_id}/orders"
+        order = {
+            "order": {
+                "type": "MARKET",
+                "instrument": fmt_inst,
+                "units": str(int(units)),
+                "timeInForce": "FOK",
+                "positionFill": "DEFAULT",
+            }
+        }
+        onfill = {}
+        if tp_price:
+            onfill.setdefault("takeProfitOnFill", {"price": f"{tp_price:.5f}"})
+        if sl_price:
+            onfill.setdefault("stopLossOnFill", {"price": f"{sl_price:.5f}"})
+        if onfill:
+            order["order"].update(onfill)
+        r = requests.post(url, headers=self._headers(), json=order, timeout=15)
+        r.raise_for_status()
+        return r.json()
+
+    def place_limit_order(self, instrument, units, price, tp_price=None, sl_price=None, expiry_seconds=3600):
+        fmt_inst = instrument if "_" in instrument else format_instrument(instrument)
+        url = f"{self.host}/v3/accounts/{self.account_id}/orders"
+        gtd = (datetime.utcnow() + timedelta(seconds=expiry_seconds)).isoformat("T") + "Z"
+        order = {
+            "order": {
+                "type": "LIMIT",
+                "instrument": fmt_inst,
+                "units": str(int(units)),
+                "price": f"{price:.5f}",
+                "timeInForce": "GTD",
+                "gtdTime": gtd,
+                "positionFill": "DEFAULT",
+            }
+        }
+        if tp_price:
+            order["order"]["takeProfitOnFill"] = {"price": f"{tp_price:.5f}"}
+        if sl_price:
+            order["order"]["stopLossOnFill"] = {"price": f"{sl_price:.5f}"}
+        r = requests.post(url, headers=self._headers(), json=order, timeout=15)
+        r.raise_for_status()
+        return r.json()
+
+    def get_open_trades(self):
+        url = f"{self.host}/v3/accounts/{self.account_id}/openTrades"
+        r = requests.get(url, headers=self._headers(), timeout=15)
+        r.raise_for_status()
+        return r.json()
+
+# --------------------------
+# Simplified SMC/ICT detection helpers (heuristics)
+# --------------------------
+
+def detect_bias(higher_tf_df):
+    """
+    Determine higher-timeframe bias. Simple heuristic:
+      - If last series of higher highs and higher lows -> bullish bias
+      - If last series of lower lows and lower highs -> bearish bias
+      - Else neutral
+    """
+    highs = higher_tf_df["h"].values[-6:]
+    lows = higher_tf_df["l"].values[-6:]
+    # detect uptrend: higher highs & higher lows
+    hh = all(highs[i] < highs[i+1] for i in range(len(highs)-1))
+    hl = all(lows[i] < lows[i+1] for i in range(len(lows)-1))
+    lh = all(highs[i] > highs[i+1] for i in range(len(highs)-1))
+    ll = all(lows[i] > lows[i+1] for i in range(len(lows)-1))
+    if hh and hl:
+        return "bull"
+    if lh and ll:
+        return "bear"
+    return "neutral"
+
+def find_order_blocks(df, lookback=40):
+    """
+    Simplified order-block finder:
+    - Identify bullish order block: last bearish candle before a bullish thrust (large green candles)
+    - Identify bearish order block: last bullish candle before a bearish thrust
+    Returns list of dicts with {'type':'bull'|'bear','high':..,'low':..,'start_idx':..,'end_idx':..}
+    NOTE: This is a heuristic — real SMC includes more nuance (origin candles, displacement, etc.)
+    """
+    obs = []
+    for i in range(2, min(len(df)-2, lookback)):
+        prev = df.iloc[-1 - i]
+        nxt1 = df.iloc[-i]
+        nxt2 = df.iloc[-i+1] if (-i+1) != 0 else None
+        # detect bullish thrust: recent candle moves strongly up
+        try:
+            # look for a big green candle after a bearish candle (potential bullish order block origin)
+            if prev["c"] < prev["o"] and nxt1["c"] > nxt1["o"] and (nxt1["c"] - nxt1["o"]) > (prev["o"] - prev["c"])*0.6:
+                ob = {"type":"bull", "high": prev["h"], "low": prev["l"], "idx": prev.name}
+                obs.append(ob)
+            # bearish thrust
+            if prev["c"] > prev["o"] and nxt1["c"] < nxt1["o"] and (prev["c"] - prev["o"]) > (nxt1["o"] - nxt1["c"])*0.6:
+                ob = {"type":"bear", "high": prev["h"], "low": prev["l"], "idx": prev.name}
+                obs.append(ob)
+        except Exception:
+            pass
+    # dedupe by range and keep most recent few
+    return obs[:6]
+
+def find_fair_value_gaps(df, lookback=60):
+    """
+    Fair Value Gap (FVG) / imbalance finder:
+    - For every 3-candle sequence, if middle candle's high/low creates a gap not touched by adjacent candles, mark it.
+    """
+    fvg = []
+    N = len(df)
+    for i in range(2, min(N-1, lookback)):
+        a = df.iloc[-i-2]
+        b = df.iloc[-i-1]
+        c = df.iloc[-i]
+        # bearish imbalance
+        if b['h'] < a['h'] and b['h'] < c['h'] and b['l'] < a['l'] and b['l'] < c['l']:
+            # a quick heuristic for imbalance: the middle candle's body leaving area
+            fvg.append({"type":"bear","high": max(b['h'], a['h']), "low": min(b['l'], c['l']), "idx": b.name})
+        # bullish imbalance
+        if b['h'] > a['h'] and b['h'] > c['h'] and b['l'] > a['l'] and b['l'] > c['l']:
+            fvg.append({"type":"bull","high": max(a['h'], c['h']), "low": min(b['l'], a['l']), "idx": b.name})
+    return fvg[:6]
+
+def detect_break_of_structure(df):
+    """
+    Very simple BOS detection:
+    - If price makes a new swing high above recent swing high -> bullish BOS
+    - If price makes a new swing low below recent swing low -> bearish BOS
+    """
+    highs = df["h"].rolling(window=10).max()
+    lows = df["l"].rolling(window=10).min()
+    last_high = highs.iloc[-2]
+    last_low = lows.iloc[-2]
+    current_high = df["h"].iloc[-1]
+    current_low = df["l"].iloc[-1]
+    if current_high > last_high:
+        return "bull"
+    if current_low < last_low:
+        return "bear"
+    return None
+
+def price_in_zone(price, zone_high, zone_low, buffer=0.0005):
+    # small buffer in price units
+    return (zone_low - buffer) <= price <= (zone_high + buffer)
+
+# --------------------------
+# Trade decision & execution logic
+# --------------------------
+
+def compute_stop_and_tp(entry_price, direction, sl_buffer_pips=15, tp_rr=CONFIG["TP_RR"]):
+    """
+    Compute stop loss and take profit based on buffer pips and RR.
+    For USD/JPY, pip = 0.01 typically; adjust for symbol accordingly.
+    """
+    pip = 0.01  # USDJPY uses 2 decimal pips in many brokers
+    sl_distance = sl_buffer_pips * pip
+    if direction == "buy":
+        sl = entry_price - sl_distance
+        tp = entry_price + sl_distance * tp_rr
+    else:
+        sl = entry_price + sl_distance
+        tp = entry_price - sl_distance * tp_rr
+    return sl, tp
+
+def decision_engine(oanda, instrument):
+    """
+    The core decision loop: fetch candles, compute bias, OBs, FVGs, BOS, and if conditions match place orders.
+    """
+    # fetch HTF and LTF candles
+    htf = oanda.get_candles(instrument, granularity=CONFIG["HFT"], count=100)
+    ltf = oanda.get_candles(instrument, granularity=CONFIG["LFT"], count=200)
+
+    bias = detect_bias(htf)
+    logging.info(f"Higher timeframe bias: {bias}")
+
+    obs = find_order_blocks(ltf, lookback=60)
+    fvg = find_fair_value_gaps(ltf, lookback=80)
+    bos = detect_break_of_structure(ltf)
+    logging.info(f"Found {len(obs)} OBs, {len(fvg)} FVGs, BOS: {bos}")
+
+    # current mid price approximated by last candle close
+    price = ltf["c"].iloc[-1]
+    # check open trades - if already open and at max, skip new entries
+    open_trades = oanda.get_open_trades()
+    count_open = len(open_trades.get("trades", []))
+    if count_open >= CONFIG["MAX_TRADES"]:
+        logging.info(f"Open trades ({count_open}) >= MAX_TRADES ({CONFIG['MAX_TRADES']}): skipping new entries")
+        return
+
+    # trading logic:
+    # - prefer entries where HTF bias == BOS direction and price is retesting an OB or FVG of that direction
+    # - on match, place a LIMIT entry at the OB / FVG zone mid (or market if price already inside)
+    target_candidates = []
+    for ob in obs:
+        # check OB type vs bias/BOS
+        if bias == "bull" and ob["type"] == "bull" and bos == "bull":
+            # check if price has returned to OB zone
+            if price_in_zone(price, ob["high"], ob["low"], buffer=0.05):
+                target_candidates.append(("buy", ob))
+            else:
+                # allow limit entry at OB midpoint
+                target_candidates.append(("buy_limit", ob))
+        if bias == "bear" and ob["type"] == "bear" and bos == "bear":
+            if price_in_zone(price, ob["high"], ob["low"], buffer=0.05):
+                target_candidates.append(("sell", ob))
+            else:
+                target_candidates.append(("sell_limit", ob))
+
+    # Also consider FVG entries
+    for gap in fvg:
+        if bias == "bull" and gap["type"] == "bull" and bos == "bull":
+            target_candidates.append(("buy_limit", gap))
+        if bias == "bear" and gap["type"] == "bear" and bos == "bear":
+            target_candidates.append(("sell_limit", gap))
+
+    # choose candidate (most recent)
+    if not target_candidates:
+        logging.info("No viable SMC candidates this cycle.")
+        return
+
+    # pick the most recent candidate
+    action, zone = target_candidates[0]
+    logging.info(f"Candidate action: {action}, zone: {zone}")
+
+    # compute entry price (limit mid) or market
+    if action.endswith("_limit"):
+        entry_price = (zone["high"] + zone["low"]) / 2.0
+        if action.startswith("buy"):
+            direction = "buy"
+            units = CONFIG["UNITS"]
+        else:
+            direction = "sell"
+            units = -abs(CONFIG["UNITS"])
+        sl, tp = compute_stop_and_tp(entry_price, direction)
+        resp = oanda.place_limit_order(CONFIG["INSTRUMENT"], units, price=entry_price, tp_price=tp, sl_price=sl)
+        logging.info(f"Placed LIMIT order: entry {entry_price:.5f}, SL {sl:.5f}, TP {tp:.5f} -> resp: {resp}")
+    else:
+        # market order
+        entry_price = price
+        if action == "buy":
+            units = CONFIG["UNITS"]
+            direction = "buy"
+        else:
+            units = -abs(CONFIG["UNITS"])
+            direction = "sell"
+        sl, tp = compute_stop_and_tp(entry_price, "buy" if units>0 else "sell")
+        resp = oanda.place_market_order(CONFIG["INSTRUMENT"], units, tp_price=tp, sl_price=sl)
+        logging.info(f"Placed MARKET order: entry {entry_price:.5f}, SL {sl:.5f}, TP {tp:.5f} -> resp: {resp}")
+
+# --------------------------
+# Main loop
+# --------------------------
+def main():
+    token = CONFIG["OANDA_API_KEY"]
+    account = CONFIG["OANDA_ACCOUNT_ID"]
+    practice = CONFIG["PRACTICE"]
+    if token.startswith("REPLACE") or account.startswith("REPLACE"):
+        logging.error("Please edit CONFIG and set your OANDA_API_KEY and OANDA_ACCOUNT_ID before running.")
+        return
+
+    oanda = OandaClient(token, account, practice=practice)
+    logging.info("Starting T Precision Trades - OANDA ICT/SMC Bot (demo). Press Ctrl+C to stop.")
+    while True:
+        try:
+            decision_engine(oanda, CONFIG["INSTRUMENT"])
+        except KeyboardInterrupt:
+            logging.info("Interrupted by user - exiting.")
+            break
+        except Exception as e:
+            logging.exception("Error in main loop: %s", e)
+        time.sleep(CONFIG["POLL_INTERVAL"])
+
+if __name__ == "__main__":
+    main()
